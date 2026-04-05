@@ -30,7 +30,7 @@
 
 static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
 
-#define DEFAULT_AUTO_OFF_MS (5000)
+#define DEFAULT_AUTO_OFF_MS (2000)
 
 /* GPIO configuration for plant watering pump/solenoid */
 #define PUMP_GPIO_PIN GPIO_NUM_1  /* Change this to your desired GPIO pin */
