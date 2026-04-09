@@ -28,16 +28,16 @@
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
 #endif
 
-static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
+static const char *TAG = "ESP_ZB_ON_OFF_PUMP";
 
-#define DEFAULT_AUTO_OFF_MS (2000)
+#define DEFAULT_AUTO_OFF_MS (10000)
 
 /* GPIO configuration for plant watering pump/solenoid */
 #define PUMP_GPIO_PIN GPIO_NUM_1  /* Change this to your desired GPIO pin */
 #define PUMP_GPIO_LEVEL 0         /* GPIO level for pump ON (1=HIGH, 0=LOW) */
 
 /* Water flow configuration */
-#define PUMP_FLOW_RATE_ML_PER_MIN 500  /* Change this to your pump's flow rate in mL/min */
+#define PUMP_FLOW_RATE_L_PER_HOUR 200  /* Change this to your pump's flow rate in L/h */
 
 /* Timer for auto-off functionality */
 static TimerHandle_t auto_off_timer = NULL;
@@ -47,17 +47,11 @@ static uint32_t current_auto_off_timeout = 0;
 
 /* Water volume tracking */
 static uint32_t pump_start_time_ms = 0;  /* When pump was last turned on */
-
+static uint32_t session_volume_ml = 0;
+static bool current_pump_state = false;
 /* Forward declaration */
 static void turn_off_light_zb_task(uint8_t param);
 
-/* Helper function to convert volume mL to 48-bit struct for Zigbee */
-static esp_zb_uint48_t volume_to_uint48(uint32_t volume_ml)
-{
-    esp_zb_uint48_t result = {0};
-    result.low = volume_ml;
-    return result;
-}
 
 /* light control function*/
 static void set_light(bool power)
@@ -65,9 +59,40 @@ static void set_light(bool power)
     light_driver_set_color_RGB(0, 0, power * 255);  // set OFF (0,0,0) or ON BLUE (0,0,255)
 }
 
+// Fonction utilitaire pour envoyer le volume
+void update_zigbee_volume() {
+    vTaskDelay(pdMS_TO_TICKS(200));
+    static float volume_liters = 0.0f;
+    volume_liters = (float)session_volume_ml;
+    ESP_LOGI(TAG, "Arrosage terminé. Volume : %fmL", volume_liters);
+
+    esp_zb_zcl_set_attribute_val(
+        HA_ESP_PUMP_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        &volume_liters,
+        false
+    );
+
+// // 2. Prepare the Report Command
+//     esp_zb_zcl_report_attr_cmd_t report_char = {
+//         .zcl_basic_cmd.src_endpoint = HA_ESP_PUMP_ENDPOINT,
+//         .zcl_basic_cmd.dst_endpoint = HA_ESP_PUMP_ENDPOINT,
+//         .zcl_basic_cmd.dst_addr_u.addr_short = 0x0000,      // Send to HA Coordinator
+//         .clusterID = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+//         .attributeID = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+//         // Remove .cluster_role if it fails, or try:
+//         // .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
+//     };
+
+//     esp_zb_zcl_report_attr_cmd_req(&report_char);    
+}
+
 /* Pump control function */
 static void pump_set_power(bool power)
 {
+    current_pump_state = power;
     if (power) {
         // Configure as output and set LOW to activate relay
         gpio_config_t io_conf = {
@@ -83,22 +108,11 @@ static void pump_set_power(bool power)
         ESP_LOGI(TAG, "Pump turned ON (GPIO output LOW) - Start time: %d ms", pump_start_time_ms);
     } else {
         // Calculate volume delivered in this session
-        uint32_t session_volume_ml = 0;
         if (pump_start_time_ms > 0) {
             uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
-            session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_ML_PER_MIN) / 60000;  // Convert to mL
+            session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
             ESP_LOGI(TAG, "Pump session: %d ms runtime, %d mL delivered", runtime_ms, session_volume_ml);
             pump_start_time_ms = 0;  // Reset start time
-            
-            // Report the session volume to HA
-            esp_zb_uint48_t volume_attr = volume_to_uint48(session_volume_ml);
-            esp_zb_zcl_set_attribute_val(HA_ESP_LIGHT_ENDPOINT, 
-                                         ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                         ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-                                         &volume_attr,
-                                         false);  // Trigger reporting
-            ESP_LOGI(TAG, "Volume pulse reported to HA: %d mL", session_volume_ml);
         }
         
         // Configure as input with pullup to deactivate relay
@@ -131,13 +145,6 @@ static void auto_off_timer_callback(TimerHandle_t xTimer)
     current_auto_off_timeout = 0;
 }
 
-/* Function to report water volume in Zigbee task context */
-static void report_water_volume_zb_task(uint8_t param)
-{
-    (void)param;  // Unused parameter
-    ESP_LOGI(TAG, "Water volume reporting enabled");
-}
-
 /* Function to turn off light in Zigbee task context */
 static void turn_off_light_zb_task(uint8_t param)
 {
@@ -150,7 +157,7 @@ static void turn_off_light_zb_task(uint8_t param)
     // Update the attribute value
     uint8_t attr_value = 0;
     esp_zb_zcl_status_t status = esp_zb_zcl_set_attribute_val(
-        HA_ESP_LIGHT_ENDPOINT,
+        HA_ESP_PUMP_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
@@ -165,7 +172,7 @@ static void turn_off_light_zb_task(uint8_t param)
     // Send an unsolicited attribute report to the coordinator
    esp_zb_zcl_report_attr_cmd_t report_cmd = {
     .zcl_basic_cmd = {
-        .src_endpoint       = HA_ESP_LIGHT_ENDPOINT,
+        .src_endpoint       = HA_ESP_PUMP_ENDPOINT,
         .dst_endpoint       = 1,        // coordinator/z2m endpoint
         .dst_addr_u.addr_short = 0x0000, // coordinator always has short addr 0x0000
     },
@@ -176,7 +183,9 @@ static void turn_off_light_zb_task(uint8_t param)
     };
     esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_cmd);
     ESP_LOGI(TAG, "Report sent to coordinator: %s", esp_err_to_name(err));
-    }
+    update_zigbee_volume();
+}
+
 /********************* Define functions **************************/
 static esp_err_t deferred_driver_init(void)
 {
@@ -233,7 +242,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             // Configure reporting for OnOff attribute after joining network
             esp_zb_zcl_reporting_info_t reporting_info = {
                 .direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
-                .ep = HA_ESP_LIGHT_ENDPOINT,
+                .ep = HA_ESP_PUMP_ENDPOINT,
                 .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
                 .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                 .attr_id = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
@@ -252,34 +261,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             };
             esp_err_t report_err = esp_zb_zcl_update_reporting_info(&reporting_info);
             ESP_LOGI(TAG, "On/Off reporting configuration updated, result: %s", esp_err_to_name(report_err));
-
-            // Configure reporting for Metering cluster (volume delivered)
-            esp_zb_zcl_reporting_info_t metering_reporting_info = {0};
-            metering_reporting_info.direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND;
-            metering_reporting_info.ep = HA_ESP_LIGHT_ENDPOINT;
-            metering_reporting_info.cluster_id = ESP_ZB_ZCL_CLUSTER_ID_METERING;
-            metering_reporting_info.cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE;
-            metering_reporting_info.attr_id = ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID;
-            metering_reporting_info.flags = 6;  // ZB_ZCL_REPORT_ATTR | ZB_ZCL_REPORT_IS_ALLOWED
-            metering_reporting_info.run_time = 0;
-            metering_reporting_info.u.send_info.min_interval = 0;
-            metering_reporting_info.u.send_info.max_interval = 300;
-            metering_reporting_info.u.send_info.delta.u48.low = 1;
-            metering_reporting_info.u.send_info.delta.u48.high = 0;
-            metering_reporting_info.u.send_info.reported_value.u48.low = 0;
-            metering_reporting_info.u.send_info.reported_value.u48.high = 0;
-            metering_reporting_info.u.send_info.def_min_interval = 0;
-            metering_reporting_info.u.send_info.def_max_interval = 0;
-            metering_reporting_info.dst.short_addr = 0x0000;
-            metering_reporting_info.dst.endpoint = 1;
-            metering_reporting_info.dst.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
-            metering_reporting_info.manuf_code = 0;
-            esp_err_t metering_report_err = esp_zb_zcl_update_reporting_info(&metering_reporting_info);
-            ESP_LOGI(TAG, "Metering reporting configuration updated, result: %s", esp_err_to_name(metering_report_err));
-
-            // Trigger initial volume report if any pump session has occurred
-            esp_zb_scheduler_alarm((esp_zb_callback_t)report_water_volume_zb_task, 0, 0);
-            ESP_LOGI(TAG, "Water volume pulse reporting enabled");
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
@@ -296,7 +277,7 @@ static esp_err_t zb_command_handler(const esp_zb_zcl_custom_cluster_command_mess
 {
     esp_err_t ret = ESP_OK;
     
-    if (message->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT) {
+    if (message->info.dst_endpoint == HA_ESP_PUMP_ENDPOINT) {
         if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             if (message->info.command.id == ESP_ZB_ZCL_CMD_ON_OFF_ON_WITH_TIMED_OFF_ID) {
                 // Handle "On with Timed Off" command
@@ -333,24 +314,33 @@ static esp_err_t zb_command_handler(const esp_zb_zcl_custom_cluster_command_mess
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
     esp_err_t ret = ESP_OK;
-    bool light_state = 0;
+    bool pump_light_state = 0;
 
     ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
     ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)",
                         message->info.status);
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
              message->attribute.id, message->attribute.data.size);
-    if (message->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT) {
+    if (message->info.dst_endpoint == HA_ESP_PUMP_ENDPOINT) {
         if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
-                light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : light_state;
-                ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
+                bool new_state = *(bool *)message->attribute.data.value;
+
+                // SI L'ÉTAT EST DÉJÀ LE BON, ON NE FAIT RIEN
+                if (new_state == current_pump_state) {
+                    ESP_LOGD(TAG, "State already %s, ignoring redundant command", new_state ? "On" : "Off");
+                    return ESP_OK; 
+                }
+
+                pump_light_state = new_state; // Mettre à jour l'état actuel                
+                //pump_light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : pump_light_state;
+                ESP_LOGI(TAG, "Light sets to %s", pump_light_state ? "On" : "Off");
                 //light_driver_set_power(light_state);
-                set_light(light_state);
-                pump_set_power(light_state);  /* Control pump along with light */
+                set_light(pump_light_state);
+                pump_set_power(pump_light_state);  /* Control pump along with light */
                 
                 // Handle auto-off timer
-                if (light_state) {
+                if (pump_light_state) {
                     // Light turned ON - start default auto-off timer
                     current_auto_off_timeout = DEFAULT_AUTO_OFF_MS;
                     if (auto_off_timer != NULL) {
@@ -366,6 +356,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                         ESP_LOGI(TAG, "Auto-off timer stopped");
                     }
                     current_auto_off_timeout = 0;
+                    update_zigbee_volume();
                 }
             }
         }
@@ -396,36 +387,57 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
     
-    // Create endpoint with On/Off cluster
-    esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
-    esp_zb_ep_list_t *esp_zb_on_off_light_ep = esp_zb_on_off_light_ep_create(HA_ESP_LIGHT_ENDPOINT, &light_cfg);
-    
-    // Add Metering cluster for water volume tracking
-    esp_zb_cluster_list_t *cluster_list = esp_zb_ep_list_get_ep(esp_zb_on_off_light_ep, HA_ESP_LIGHT_ENDPOINT);
-    
-    // Configure metering cluster for water volume
-    esp_zb_metering_cluster_cfg_t metering_cfg = {
-        .current_summation_delivered = {0},  // Start at 0 - each pulse is a new delivery
-        .status = 0x00,                      // No error status
-        .uint_of_measure = 0x00,             // Liters (for mL compatibility)
-        .summation_formatting = 0x00,        // No special formatting
-        .metering_device_type = 0x02,        // Water meter
-    };
-    
-    // Create metering cluster
-    esp_zb_attribute_list_t *metering_cluster = esp_zb_metering_cluster_create(&metering_cfg);
-    
-    // Add cluster to endpoint
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_metering_cluster(cluster_list, metering_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-    ESP_LOGI(TAG, "Metering cluster added to endpoint %d", HA_ESP_LIGHT_ENDPOINT);
+    // 1. Création du cluster On/Off (pour la pompe)
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = { .on_off = false };
+    esp_zb_attribute_list_t *on_off_attr_list = esp_zb_on_off_cluster_create(&on_off_cfg);
 
-    zcl_basic_manufacturer_info_t info = {
-        .manufacturer_name = ESP_MANUFACTURER_NAME,
-        .model_identifier = ESP_MODEL_IDENTIFIER,
+    // 2. Création du cluster Analog Input (pour le volume d'eau)
+    esp_zb_analog_input_cluster_cfg_t analog_input_cfg = {
+        .present_value = 0.0f, // Volume initial
+        .out_of_service = false,
+        .status_flags = 0
+    };
+    esp_zb_attribute_list_t *analog_input_attr_list = esp_zb_analog_input_cluster_create(&analog_input_cfg);
+
+    // 3. Création de la liste des clusters pour l'Endpoint
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_on_off_cluster(cluster_list, on_off_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_analog_input_cluster(cluster_list, analog_input_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    // 4. Enregistrement de l'Endpoint
+    esp_zb_endpoint_config_t endpoint_config = {
+        .endpoint = HA_ESP_PUMP_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID, // On utilise "Output" pour un actionneur
+    };
+    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
+    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+
+    // Enregistrement final du device
+    esp_zb_device_register(ep_list);
+
+    esp_zb_zcl_reporting_info_t reporting_info = {
+        .direction = 0,               // 0 = Send
+        .ep = HA_ESP_PUMP_ENDPOINT,   // Le champ s'appelle .ep
+        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .attr_id = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        .u.send_info = {
+            .min_interval = 1,
+            .max_interval = 0,        // 0 = Pas de rapport périodique, seulement sur changement
+            .def_min_interval = 1,
+            .def_max_interval = 0,
+        },
+        .dst = {
+            .short_addr = 0x0000,     // Destination : Coordinateur (Home Assistant)
+            .endpoint = HA_ESP_PUMP_ENDPOINT,
+            .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        }
     };
 
-    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_on_off_light_ep, HA_ESP_LIGHT_ENDPOINT, &info);
-    esp_zb_device_register(esp_zb_on_off_light_ep);
+    // Enregistrement de la configuration
+    esp_zb_zcl_update_reporting_info(&reporting_info);
+
     
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
