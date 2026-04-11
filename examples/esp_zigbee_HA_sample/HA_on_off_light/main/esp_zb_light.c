@@ -14,16 +14,178 @@
 #include "esp_zb_light.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "ha/esp_zigbee_ha_standard.h"
+#include "zcl/esp_zigbee_zcl_metering.h"
+#include "esp_zigbee_type.h"
 
 #if !defined ZB_ED_ROLE
 #error Define ZB_ED_ROLE in idf.py menuconfig to compile light (End Device) source code.
 #endif
 
-static const char *TAG = "ESP_ZB_ON_OFF_LIGHT";
+static const char *TAG = "ESP_ZB_ON_OFF_PUMP";
+
+#define DEFAULT_AUTO_OFF_MS (10000)
+
+/* GPIO configuration for plant watering pump/solenoid */
+#define PUMP_GPIO_PIN GPIO_NUM_1  /* Change this to your desired GPIO pin */
+#define PUMP_GPIO_LEVEL 0         /* GPIO level for pump ON (1=HIGH, 0=LOW) */
+
+/* Water flow configuration */
+#define PUMP_FLOW_RATE_L_PER_HOUR 200  /* Change this to your pump's flow rate in L/h */
+
+/* Timer for auto-off functionality */
+static TimerHandle_t auto_off_timer = NULL;
+
+/* Current auto-off timeout in milliseconds */
+static uint32_t current_auto_off_timeout = 0;
+
+/* Water volume tracking */
+static uint32_t pump_start_time_ms = 0;  /* When pump was last turned on */
+static uint32_t session_volume_ml = 0;
+static bool current_pump_state = false;
+/* Forward declaration */
+static void turn_off_light_zb_task(uint8_t param);
+
+
+/* light control function*/
+static void set_light(bool power)
+{
+    light_driver_set_color_RGB(0, 0, power * 255);  // set OFF (0,0,0) or ON BLUE (0,0,255)
+}
+
+// Fonction utilitaire pour envoyer le volume
+void update_zigbee_volume() {
+    vTaskDelay(pdMS_TO_TICKS(200));
+    static float volume_liters = 0.0f;
+    volume_liters = (float)session_volume_ml;
+    ESP_LOGI(TAG, "Arrosage terminé. Volume : %fmL", volume_liters);
+
+    esp_zb_zcl_set_attribute_val(
+        HA_ESP_PUMP_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        &volume_liters,
+        false
+    );
+
+// // 2. Prepare the Report Command
+//     esp_zb_zcl_report_attr_cmd_t report_char = {
+//         .zcl_basic_cmd.src_endpoint = HA_ESP_PUMP_ENDPOINT,
+//         .zcl_basic_cmd.dst_endpoint = HA_ESP_PUMP_ENDPOINT,
+//         .zcl_basic_cmd.dst_addr_u.addr_short = 0x0000,      // Send to HA Coordinator
+//         .clusterID = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+//         .attributeID = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+//         // Remove .cluster_role if it fails, or try:
+//         // .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
+//     };
+
+//     esp_zb_zcl_report_attr_cmd_req(&report_char);    
+}
+
+/* Pump control function */
+static void pump_set_power(bool power)
+{
+    current_pump_state = power;
+    if (power) {
+        // Configure as output and set LOW to activate relay
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << PUMP_GPIO_PIN),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(PUMP_GPIO_PIN, PUMP_GPIO_LEVEL);  // LOW to activate relay
+        pump_start_time_ms = esp_timer_get_time() / 1000;  // Record start time in ms
+        ESP_LOGI(TAG, "Pump turned ON (GPIO output LOW) - Start time: %d ms", pump_start_time_ms);
+    } else {
+        // Calculate volume delivered in this session
+        if (pump_start_time_ms > 0) {
+            uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
+            session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
+            ESP_LOGI(TAG, "Pump session: %d ms runtime, %d mL delivered", runtime_ms, session_volume_ml);
+            pump_start_time_ms = 0;  // Reset start time
+        }
+        
+        // Configure as input with pullup to deactivate relay
+        gpio_config_t io_conf = {
+            .pin_bit_mask = (1ULL << PUMP_GPIO_PIN),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        ESP_LOGI(TAG, "Pump turned OFF (GPIO input with pullup)");
+    }
+}
+
+/* Initialize GPIO for pump control */
+static void pump_init(void)
+{
+    // Start with pump OFF (input with pullup)
+    pump_set_power(false);
+    ESP_LOGI(TAG, "Pump GPIO initialized on pin %d (input with pullup)", PUMP_GPIO_PIN);
+}
+
+/* Timer callback to turn off the light */
+static void auto_off_timer_callback(TimerHandle_t xTimer)
+{
+    ESP_LOGI(TAG, "Auto-off timer expired, turning light off");
+    // Schedule attribute update in Zigbee task context
+    esp_zb_scheduler_alarm((esp_zb_callback_t)turn_off_light_zb_task, 0, 0);
+    current_auto_off_timeout = 0;
+}
+
+/* Function to turn off light in Zigbee task context */
+static void turn_off_light_zb_task(uint8_t param)
+{
+    (void)param;
+
+    set_light(false);
+    pump_set_power(false);
+    ESP_LOGI(TAG, "Light and pump turned OFF by auto-off timer");
+
+    // Update the attribute value
+    uint8_t attr_value = 0;
+    esp_zb_zcl_status_t status = esp_zb_zcl_set_attribute_val(
+        HA_ESP_PUMP_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+        &attr_value,
+        false);  // <-- false: don't mark as "needs reporting", we send manually
+
+    if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        ESP_LOGW(TAG, "Failed to update OnOff attribute: %d", status);
+        return;
+    }
+
+    // Send an unsolicited attribute report to the coordinator
+   esp_zb_zcl_report_attr_cmd_t report_cmd = {
+    .zcl_basic_cmd = {
+        .src_endpoint       = HA_ESP_PUMP_ENDPOINT,
+        .dst_endpoint       = 1,        // coordinator/z2m endpoint
+        .dst_addr_u.addr_short = 0x0000, // coordinator always has short addr 0x0000
+    },
+    .address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+    .clusterID    = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+    .direction    = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+    .attributeID  = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+    };
+    esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_cmd);
+    ESP_LOGI(TAG, "Report sent to coordinator: %s", esp_err_to_name(err));
+    update_zigbee_volume();
+}
+
 /********************* Define functions **************************/
 static esp_err_t deferred_driver_init(void)
 {
@@ -76,6 +238,29 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            
+            // Configure reporting for OnOff attribute after joining network
+            esp_zb_zcl_reporting_info_t reporting_info = {
+                .direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
+                .ep = HA_ESP_PUMP_ENDPOINT,
+                .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
+                .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                .attr_id = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
+                .flags = 6,  // ZB_ZCL_REPORT_ATTR | ZB_ZCL_REPORT_IS_ALLOWED
+                .u.send_info = {
+                    .min_interval = 0,  // Minimum reporting interval in seconds
+                    .max_interval = 300,  // Maximum reporting interval (5 minutes)
+                    .delta = { .u8 = 1 },  // Report on any change
+                    .reported_value = { .u8 = 0 }  // Initial value
+                },
+                .dst = {
+                    .short_addr = 0x0000,  // Report to coordinator
+                    .endpoint = 1,
+                    .profile_id = ESP_ZB_AF_HA_PROFILE_ID
+                }
+            };
+            esp_err_t report_err = esp_zb_zcl_update_reporting_info(&reporting_info);
+            ESP_LOGI(TAG, "On/Off reporting configuration updated, result: %s", esp_err_to_name(report_err));
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
@@ -88,22 +273,91 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     }
 }
 
+static esp_err_t zb_command_handler(const esp_zb_zcl_custom_cluster_command_message_t *message)
+{
+    esp_err_t ret = ESP_OK;
+    
+    if (message->info.dst_endpoint == HA_ESP_PUMP_ENDPOINT) {
+        if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
+            if (message->info.command.id == ESP_ZB_ZCL_CMD_ON_OFF_ON_WITH_TIMED_OFF_ID) {
+                // Handle "On with Timed Off" command
+                esp_zb_zcl_on_off_on_with_timed_off_cmd_t *cmd = (esp_zb_zcl_on_off_on_with_timed_off_cmd_t *)message->data.value;
+                
+                // Turn on the light and pump
+                // light_driver_set_power(true);
+                set_light (true);
+                pump_set_power(true);
+                ESP_LOGI(TAG, "Light and pump turned ON with timed off (on_time: %d tenths of second)", cmd->on_time);
+                
+                // Start timer for auto-off (convert from tenths of second to milliseconds)
+                current_auto_off_timeout = cmd->on_time * 100;  // on_time is in 1/10ths second
+                
+                if (auto_off_timer != NULL) {
+                    // Stop any existing timer first
+                    xTimerStop(auto_off_timer, 0);
+                    
+                    // Change timer period and start
+                    if (xTimerChangePeriod(auto_off_timer, pdMS_TO_TICKS(current_auto_off_timeout), 0) == pdPASS) {
+                        xTimerStart(auto_off_timer, 0);
+                        ESP_LOGI(TAG, "Auto-off timer started (%d ms)", current_auto_off_timeout);
+                    } else {
+                        ESP_LOGE(TAG, "Failed to change timer period");
+                    }
+                }
+            }
+        }
+    }
+    
+    return ret;
+}
+
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
     esp_err_t ret = ESP_OK;
-    bool light_state = 0;
+    bool pump_light_state = 0;
 
     ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
     ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)",
                         message->info.status);
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
              message->attribute.id, message->attribute.data.size);
-    if (message->info.dst_endpoint == HA_ESP_LIGHT_ENDPOINT) {
+    if (message->info.dst_endpoint == HA_ESP_PUMP_ENDPOINT) {
         if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF) {
             if (message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID && message->attribute.data.type == ESP_ZB_ZCL_ATTR_TYPE_BOOL) {
-                light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : light_state;
-                ESP_LOGI(TAG, "Light sets to %s", light_state ? "On" : "Off");
-                light_driver_set_power(light_state);
+                bool new_state = *(bool *)message->attribute.data.value;
+
+                // SI L'ÉTAT EST DÉJÀ LE BON, ON NE FAIT RIEN
+                if (new_state == current_pump_state) {
+                    ESP_LOGD(TAG, "State already %s, ignoring redundant command", new_state ? "On" : "Off");
+                    return ESP_OK; 
+                }
+
+                pump_light_state = new_state; // Mettre à jour l'état actuel                
+                //pump_light_state = message->attribute.data.value ? *(bool *)message->attribute.data.value : pump_light_state;
+                ESP_LOGI(TAG, "Light sets to %s", pump_light_state ? "On" : "Off");
+                //light_driver_set_power(light_state);
+                set_light(pump_light_state);
+                pump_set_power(pump_light_state);  /* Control pump along with light */
+                
+                // Handle auto-off timer
+                if (pump_light_state) {
+                    // Light turned ON - start default auto-off timer
+                    current_auto_off_timeout = DEFAULT_AUTO_OFF_MS;
+                    if (auto_off_timer != NULL) {
+                        xTimerStop(auto_off_timer, 0);
+                        xTimerChangePeriod(auto_off_timer, pdMS_TO_TICKS(current_auto_off_timeout), 0);
+                        xTimerStart(auto_off_timer, 0);
+                        ESP_LOGI(TAG, "Auto-off timer started (%d ms, default)", current_auto_off_timeout);
+                    }
+                } else {
+                    // Light turned OFF - stop timer if running
+                    if (auto_off_timer != NULL) {
+                        xTimerStop(auto_off_timer, 0);
+                        ESP_LOGI(TAG, "Auto-off timer stopped");
+                    }
+                    current_auto_off_timeout = 0;
+                    update_zigbee_volume();
+                }
             }
         }
     }
@@ -117,6 +371,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
+    case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
+        ret = zb_command_handler((esp_zb_zcl_custom_cluster_command_message_t *)message);
+        break;
     default:
         ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
         break;
@@ -129,15 +386,59 @@ static void esp_zb_task(void *pvParameters)
     /* initialize Zigbee stack */
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
-    esp_zb_on_off_light_cfg_t light_cfg = ESP_ZB_DEFAULT_ON_OFF_LIGHT_CONFIG();
-    esp_zb_ep_list_t *esp_zb_on_off_light_ep = esp_zb_on_off_light_ep_create(HA_ESP_LIGHT_ENDPOINT, &light_cfg);
-    zcl_basic_manufacturer_info_t info = {
-        .manufacturer_name = ESP_MANUFACTURER_NAME,
-        .model_identifier = ESP_MODEL_IDENTIFIER,
+    
+    // 1. Création du cluster On/Off (pour la pompe)
+    esp_zb_on_off_cluster_cfg_t on_off_cfg = { .on_off = false };
+    esp_zb_attribute_list_t *on_off_attr_list = esp_zb_on_off_cluster_create(&on_off_cfg);
+
+    // 2. Création du cluster Analog Input (pour le volume d'eau)
+    esp_zb_analog_input_cluster_cfg_t analog_input_cfg = {
+        .present_value = 0.0f, // Volume initial
+        .out_of_service = false,
+        .status_flags = 0
+    };
+    esp_zb_attribute_list_t *analog_input_attr_list = esp_zb_analog_input_cluster_create(&analog_input_cfg);
+
+    // 3. Création de la liste des clusters pour l'Endpoint
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_on_off_cluster(cluster_list, on_off_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    esp_zb_cluster_list_add_analog_input_cluster(cluster_list, analog_input_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    // 4. Enregistrement de l'Endpoint
+    esp_zb_endpoint_config_t endpoint_config = {
+        .endpoint = HA_ESP_PUMP_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID, // On utilise "Output" pour un actionneur
+    };
+    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
+    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+
+    // Enregistrement final du device
+    esp_zb_device_register(ep_list);
+
+    esp_zb_zcl_reporting_info_t reporting_info = {
+        .direction = 0,               // 0 = Send
+        .ep = HA_ESP_PUMP_ENDPOINT,   // Le champ s'appelle .ep
+        .cluster_id = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        .attr_id = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        .u.send_info = {
+            .min_interval = 1,
+            .max_interval = 0,        // 0 = Pas de rapport périodique, seulement sur changement
+            .def_min_interval = 1,
+            .def_max_interval = 0,
+        },
+        .dst = {
+            .short_addr = 0x0000,     // Destination : Coordinateur (Home Assistant)
+            .endpoint = HA_ESP_PUMP_ENDPOINT,
+            .profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        }
     };
 
-    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_on_off_light_ep, HA_ESP_LIGHT_ENDPOINT, &info);
-    esp_zb_device_register(esp_zb_on_off_light_ep);
+    // Enregistrement de la configuration
+    esp_zb_zcl_update_reporting_info(&reporting_info);
+
+    
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
@@ -150,6 +451,21 @@ void app_main(void)
         .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
         .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
     };
+    
+    /* Initialize pump GPIO control */
+    pump_init();
+    
+    /* Create auto-off timer (default 5 seconds, but will be changed dynamically) */
+    auto_off_timer = xTimerCreate("auto_off_timer", 
+                                  pdMS_TO_TICKS(5000),  // Default 5 seconds
+                                  pdFALSE,              // One-shot timer
+                                  NULL, 
+                                  auto_off_timer_callback);
+    
+    if (auto_off_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create auto-off timer");
+    }
+    
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
