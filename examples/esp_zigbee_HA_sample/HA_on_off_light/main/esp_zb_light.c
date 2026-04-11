@@ -39,16 +39,18 @@ static const char *TAG = "ESP_ZB_ON_OFF_PUMP";
 /* Water flow configuration */
 #define PUMP_FLOW_RATE_L_PER_HOUR 200  /* Change this to your pump's flow rate in L/h */
 
+static bool g_pump_running = false;  /* Track pump state for volume calculation */
 /* Timer for auto-off functionality */
 static TimerHandle_t auto_off_timer = NULL;
 
+static TaskHandle_t volume_task_handle = NULL;
 /* Current auto-off timeout in milliseconds */
 static uint32_t current_auto_off_timeout = 0;
 
 /* Water volume tracking */
 static uint32_t pump_start_time_ms = 0;  /* When pump was last turned on */
 static uint32_t session_volume_ml = 0;
-static bool current_pump_state = false;
+
 /* Forward declaration */
 static void turn_off_light_zb_task(uint8_t param);
 
@@ -61,10 +63,13 @@ static void set_light(bool power)
 
 // Fonction utilitaire pour envoyer le volume
 void update_zigbee_volume() {
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // Calculate volume delivered in this session
+    uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
+    session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
+    ESP_LOGI(TAG, "Pump session: %d ms runtime, %d mL delivered", runtime_ms, session_volume_ml);
+    vTaskDelay(pdMS_TO_TICKS(10));
     static float volume_liters = 0.0f;
     volume_liters = (float)session_volume_ml;
-    ESP_LOGI(TAG, "Arrosage terminé. Volume : %fmL", volume_liters);
 
     esp_zb_zcl_set_attribute_val(
         HA_ESP_PUMP_ENDPOINT,
@@ -74,25 +79,12 @@ void update_zigbee_volume() {
         &volume_liters,
         false
     );
-
-// // 2. Prepare the Report Command
-//     esp_zb_zcl_report_attr_cmd_t report_char = {
-//         .zcl_basic_cmd.src_endpoint = HA_ESP_PUMP_ENDPOINT,
-//         .zcl_basic_cmd.dst_endpoint = HA_ESP_PUMP_ENDPOINT,
-//         .zcl_basic_cmd.dst_addr_u.addr_short = 0x0000,      // Send to HA Coordinator
-//         .clusterID = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-//         .attributeID = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-//         // Remove .cluster_role if it fails, or try:
-//         // .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
-//     };
-
-//     esp_zb_zcl_report_attr_cmd_req(&report_char);    
 }
 
 /* Pump control function */
 static void pump_set_power(bool power)
 {
-    current_pump_state = power;
+    g_pump_running = power;
     if (power) {
         // Configure as output and set LOW to activate relay
         gpio_config_t io_conf = {
@@ -105,17 +97,11 @@ static void pump_set_power(bool power)
         gpio_config(&io_conf);
         gpio_set_level(PUMP_GPIO_PIN, PUMP_GPIO_LEVEL);  // LOW to activate relay
         pump_start_time_ms = esp_timer_get_time() / 1000;  // Record start time in ms
+        if (volume_task_handle != NULL) {
+            xTaskNotifyGive(volume_task_handle);
+        }
         ESP_LOGI(TAG, "Pump turned ON (GPIO output LOW) - Start time: %d ms", pump_start_time_ms);
     } else {
-        // Calculate volume delivered in this session
-        if (pump_start_time_ms > 0) {
-            uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
-            session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
-            ESP_LOGI(TAG, "Pump session: %d ms runtime, %d mL delivered", runtime_ms, session_volume_ml);
-            pump_start_time_ms = 0;  // Reset start time
-        }
-        
-        // Configure as input with pullup to deactivate relay
         gpio_config_t io_conf = {
             .pin_bit_mask = (1ULL << PUMP_GPIO_PIN),
             .mode = GPIO_MODE_INPUT,
@@ -183,7 +169,6 @@ static void turn_off_light_zb_task(uint8_t param)
     };
     esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_cmd);
     ESP_LOGI(TAG, "Report sent to coordinator: %s", esp_err_to_name(err));
-    update_zigbee_volume();
 }
 
 /********************* Define functions **************************/
@@ -327,7 +312,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                 bool new_state = *(bool *)message->attribute.data.value;
 
                 // SI L'ÉTAT EST DÉJÀ LE BON, ON NE FAIT RIEN
-                if (new_state == current_pump_state) {
+                if (new_state == g_pump_running) {
                     ESP_LOGD(TAG, "State already %s, ignoring redundant command", new_state ? "On" : "Off");
                     return ESP_OK; 
                 }
@@ -356,7 +341,6 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
                         ESP_LOGI(TAG, "Auto-off timer stopped");
                     }
                     current_auto_off_timeout = 0;
-                    update_zigbee_volume();
                 }
             }
         }
@@ -379,6 +363,27 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
         break;
     }
     return ret;
+}
+
+static void volume_reporting_task(void *pvParameters){
+    while (1) {
+        // La tâche s'endort ici et attend un "signal" pour commencer
+        // PortMaxDelay = elle ne consomme rien tant qu'elle ne reçoit pas de notification
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        ESP_LOGI(TAG, "Début du reporting temps réel...");
+
+        while (g_pump_running) {
+            update_zigbee_volume();
+            // Intervalle de reporting (ex: toutes les secondes)
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        // Envoi final une fois que la pompe s'arrête
+        update_zigbee_volume();
+        pump_start_time_ms = 0;  // Reset start time
+        ESP_LOGI(TAG, "Fin du reporting. Retour en veille.");
+    }
 }
 
 static void esp_zb_task(void *pvParameters)
@@ -469,4 +474,5 @@ void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+    xTaskCreate(volume_reporting_task, "report_volume", 4096, NULL, 3, &volume_task_handle);
 }
