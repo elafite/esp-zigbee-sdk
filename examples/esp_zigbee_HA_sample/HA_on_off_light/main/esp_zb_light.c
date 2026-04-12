@@ -178,6 +178,12 @@ static void turn_off_zb_task(uint8_t param)
     };
     esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&report_cmd);
     ESP_LOGI(TAG, "Report sent to coordinator: %s", esp_err_to_name(err));
+
+    // Calculate volume delivered in this session
+    uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
+    session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
+    update_volume_callback(0);
+    pump_start_time_ms = 0;  // Reset start time for next session
 }
 
 /********************* Define functions **************************/
@@ -413,8 +419,8 @@ static void volume_reporting_task(void *pvParameters){
         }
 
         // Envoi final une fois que la pompe s'arrête
-        update_zigbee_volume();
-        pump_start_time_ms = 0;  // Reset start time
+        //update_zigbee_volume();
+        //pump_start_time_ms = 0;  // Reset start time
         ESP_LOGI(TAG, "Fin du reporting. Retour en veille.");
     }
 }
