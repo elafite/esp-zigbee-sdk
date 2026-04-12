@@ -54,7 +54,7 @@ static uint32_t pump_start_time_ms = 0;  /* When pump was last turned on */
 static uint32_t session_volume_ml = 0;
 
 /* Forward declaration */
-static void turn_off_light_zb_task(uint8_t param);
+static void turn_off_zb_task(uint8_t param);
 
 
 /* light control function*/
@@ -63,16 +63,12 @@ static void set_light(bool power)
     light_driver_set_color_RGB(0, 0, power * 255);  // set OFF (0,0,0) or ON BLUE (0,0,255)
 }
 
-// Fonction utilitaire pour envoyer le volume
-void update_zigbee_volume() {
-    // Calculate volume delivered in this session
-    uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
-    session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
-    ESP_LOGI(TAG, "Pump session: %d ms runtime, %d mL delivered", runtime_ms, session_volume_ml);
-    vTaskDelay(pdMS_TO_TICKS(200));
-    static float volume_liters = 0.0f;
-    volume_liters = (float)session_volume_ml;
-
+static void update_volume_callback(uint8_t param)
+{
+    // On récupère la valeur statique ou via un pointeur
+    // Pour faire simple ici, on va utiliser une variable globale ou lire la session_volume_ml
+    float volume_liters = (float)session_volume_ml; 
+    
     esp_zb_zcl_set_attribute_val(
         HA_ESP_PUMP_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
@@ -81,6 +77,15 @@ void update_zigbee_volume() {
         &volume_liters,
         false
     );
+}
+
+// Fonction utilitaire pour envoyer le volume
+void update_zigbee_volume() {
+    // Calculate volume delivered in this session
+    uint32_t runtime_ms = esp_timer_get_time() / 1000 - pump_start_time_ms;
+    session_volume_ml = (runtime_ms * PUMP_FLOW_RATE_L_PER_HOUR) / 3600;  // Convert to mL
+    ESP_LOGI(TAG, "Pump session: %d ms runtime, %d mL delivered", runtime_ms, session_volume_ml);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)update_volume_callback, 0, 0);
 }
 
 /* Pump control function */
@@ -129,29 +134,31 @@ static void auto_off_timer_callback(TimerHandle_t xTimer)
 {
     ESP_LOGI(TAG, "Auto-off timer expired, turning light off");
     // Schedule attribute update in Zigbee task context
-    esp_zb_scheduler_alarm((esp_zb_callback_t)turn_off_light_zb_task, 0, 0);
+    set_light(false);
+    pump_set_power(false);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)turn_off_zb_task, 0, 0);
     current_auto_off_timeout = 0;
 }
 
 /* Function to turn off light in Zigbee task context */
-static void turn_off_light_zb_task(uint8_t param)
+static void turn_off_zb_task(uint8_t param)
 {
-    (void)param;
+//    (void)param;
 
-    set_light(false);
-    pump_set_power(false);
+    // set_light(false);
+    // pump_set_power(false);
     ESP_LOGI(TAG, "Light and pump turned OFF by auto-off timer");
 
     // Update the attribute value
-    uint8_t attr_value = 0;
+     uint8_t attr_value = 0;
     esp_zb_zcl_status_t status = esp_zb_zcl_set_attribute_val(
         HA_ESP_PUMP_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID,
         &attr_value,
-        false);  // <-- false: don't mark as "needs reporting", we send manually
-
+        false);  // <-- false to avoid triggering another report
+    
     if (status != ESP_ZB_ZCL_STATUS_SUCCESS) {
         ESP_LOGW(TAG, "Failed to update OnOff attribute: %d", status);
         return;
@@ -209,6 +216,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
                 ESP_LOGI(TAG, "Device rebooted");
+                //update_volume_callback(0);  // Update volume attribute on reboot to reflect current state
             }
         } else {
             ESP_LOGW(TAG, "%s failed with status: %s, retrying", esp_zb_zdo_signal_to_string(sig_type),
@@ -306,6 +314,9 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     ESP_RETURN_ON_FALSE(message, ESP_FAIL, TAG, "Empty message");
     ESP_RETURN_ON_FALSE(message->info.status == ESP_ZB_ZCL_STATUS_SUCCESS, ESP_ERR_INVALID_ARG, TAG, "Received message: error status(%d)",
                         message->info.status);
+    if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT) {
+        return ESP_OK; 
+    }
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
              message->attribute.id, message->attribute.data.size);
     if (message->info.dst_endpoint == HA_ESP_PUMP_ENDPOINT) {
@@ -369,9 +380,9 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
         break;
-    // case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
-    //     ret = zb_command_handler((esp_zb_zcl_custom_cluster_command_message_t *)message);
-    //     break;
+     case ESP_ZB_CORE_CMD_CUSTOM_CLUSTER_REQ_CB_ID:
+         //ret = zb_command_handler((esp_zb_zcl_custom_cluster_command_message_t *)message);
+        break;
     default:
         ESP_LOGW(TAG, "Receive Zigbee action(0x%x) callback", callback_id);
         break;
@@ -380,17 +391,25 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 }
 
 static void volume_reporting_task(void *pvParameters){
+    
+    static uint32_t last_reporting_ms; 
     while (1) {
         // La tâche s'endort ici et attend un "signal" pour commencer
         // PortMaxDelay = elle ne consomme rien tant qu'elle ne reçoit pas de notification
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
         ESP_LOGI(TAG, "Début du reporting temps réel...");
+        
+        last_reporting_ms = esp_timer_get_time() / 1000; // Initialiser le temps de référence
 
         while (g_pump_running) {
-            update_zigbee_volume();
-            // Intervalle de reporting (ex: toutes les secondes)
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            uint32_t elapsed_since_last_reporting = esp_timer_get_time() / 1000 - last_reporting_ms;
+            if (elapsed_since_last_reporting >= 2000) { // Report every 2000 ms
+                last_reporting_ms = esp_timer_get_time() / 1000; // Reset reference time
+                ESP_LOGI(TAG, "Reporting volume..."); // Log pour debug
+                update_zigbee_volume();
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
 
         // Envoi final une fois que la pompe s'arrête
@@ -406,10 +425,32 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&zb_nwk_cfg);
     
+    // 1. Préparer les données (Format Zigbee : longueur en premier octet)
+    uint8_t mfr_name[] = {7, 'E', 'm', 'l', ' ', 'I', 'o', 'T'};
+    uint8_t model_id[] = {14, 'p', 'l', 'a', 'n', 't', '-', 'w', 'a', 't', 'e', 'r', 'i', 'n', 'g'};
+
+    // 2. Créer la configuration de base
+    esp_zb_basic_cluster_cfg_t basic_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+
+    // 3. Créer la liste d'attributs et AJOUTER tes infos
+    esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+
+    // Pour le Fabricant (Eml IoT)
+    esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, mfr_name);
+
+    // Pour le Modèle (plant-watering)
+    esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_id);    
+
+
     // 1. Création du cluster On/Off (pour la pompe)
     esp_zb_on_off_cluster_cfg_t on_off_cfg = { .on_off = false };
     esp_zb_attribute_list_t *on_off_attr_list = esp_zb_on_off_cluster_create(&on_off_cfg);
 
+    uint8_t read_write_access = ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING;
+    esp_zb_cluster_update_attr(on_off_attr_list, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &read_write_access);
     // 2. Création du cluster Analog Input (pour le volume d'eau)
     esp_zb_analog_input_cluster_cfg_t analog_input_cfg = {
         .present_value = 0.0f, // Volume initial
@@ -437,6 +478,7 @@ static void esp_zb_task(void *pvParameters)
 
     // 3. Création de la liste des clusters pour l'Endpoint
     esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_on_off_cluster(cluster_list, on_off_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_analog_input_cluster(cluster_list, analog_input_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
     esp_zb_cluster_list_add_analog_value_cluster(cluster_list, analog_val_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);

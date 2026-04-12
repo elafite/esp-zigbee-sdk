@@ -25,7 +25,7 @@
 
 /* Basic manufacturer information */
 #define ESP_MANUFACTURER_NAME "\x07""Eml IoT"      /* Customized manufacturer name */
-#define ESP_MODEL_IDENTIFIER "\x0E""plant-watering-2" /* Customized model identifier */
+#define ESP_MODEL_IDENTIFIER "\x0E""plant-watering" /* Customized model identifier */
 
 #define ESP_ZB_ZED_CONFIG()                                         \
     {                                                               \
